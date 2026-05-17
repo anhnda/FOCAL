@@ -1,15 +1,15 @@
 """
-Forward-Only PACE Gradient Attribution (FD variant)
-====================================================
+Forward-Only PACE Gradient Attribution (FD variant) — vectorized
+====================================================================
 
 A gradient-free variant of PACE-Grad that replaces autograd-based gate
 sensitivities `v_i^{(t)} = d y_hat / d g_i` with finite-difference probes
 along the same integration path. The perturbation size is the natural
-step size of the path itself (h = 1/steps), so no extra hyperparameter
+step size of the path itself (h = 1/(steps-1)), so no extra hyperparameter
 is introduced.
 
 For each integration step t = 1..m, at base gate g^{(t-1)} = (t-1)/m * 1:
-    u_i^{(t)} = y_hat( g^{(t-1)} + (1/m) * e_i ) - y_hat( g^{(t-1)} )
+    u_i^{(t)} = y_hat( g^{(t-1)} + h * e_i ) - y_hat( g^{(t-1)} )
 
 This costs (L+1) forward passes per step but is fully batched, runs under
 torch.no_grad(), and deploys on quantized models where autograd is
@@ -20,6 +20,12 @@ unavailable. The attribution formula is otherwise identical to PACE-Grad:
 
 where delta_y_hat^{(t)} is the *true* joint output change (preserves
 exact completeness; see PACE-N analysis).
+
+This version vectorizes the per-step loop into a single batched forward:
+all `steps - 1` active steps are assembled into one tensor of shape
+(T, L+2, L), flattened to (T*(L+2), L), and pushed through the model in
+chunks. Output is numerically equivalent to the loop version (bit-exact
+in fp64; within rounding in fp16/bf16).
 
 Interface is intentionally identical to pace_gradients.py — same args,
 same return dict keys — so eval scripts can swap implementations cleanly.
@@ -180,7 +186,44 @@ def _chunked_forward_logits(
 
 
 # ---------------------------------------------------------------------------
-# Classification attribution (forward-only)
+# Internal helper: assemble the full (T, L+2, L) gate block
+# ---------------------------------------------------------------------------
+
+def _build_gate_block(
+    g_path: torch.Tensor,   # (steps, L)
+    eye_L: torch.Tensor,    # (L, L)
+    h: float,
+) -> torch.Tensor:
+    """
+    Build the per-step probe batch for every active step in one shot.
+
+    Returns
+    -------
+    gate_block : (T, L+2, L) where T = steps - 1
+        row 0       : base   = g_path[t-1]
+        rows 1..L   : probes = g_path[t-1] + h * e_i, clamped to <= 1
+        row L+1     : joint  = g_path[t]
+    """
+    g_prev_all = g_path[:-1]                                  # (T, L)
+    g_curr_all = g_path[1:]                                   # (T, L)
+
+    # probes_all[t, i, :] = g_path[t] + h * e_i (clamped)
+    probes_all = g_prev_all.unsqueeze(1) + h * eye_L.unsqueeze(0)
+    probes_all = probes_all.clamp(max=1.0)                    # (T, L, L)
+
+    gate_block = torch.cat(
+        [
+            g_prev_all.unsqueeze(1),                          # (T, 1, L)
+            probes_all,                                       # (T, L, L)
+            g_curr_all.unsqueeze(1),                          # (T, 1, L)
+        ],
+        dim=1,
+    )                                                         # (T, L+2, L)
+    return gate_block
+
+
+# ---------------------------------------------------------------------------
+# Classification attribution (forward-only, vectorized)
 # ---------------------------------------------------------------------------
 
 def pace_gradient_classification(
@@ -206,7 +249,7 @@ def pace_gradient_classification(
     ----------
     chunk_size : int
         Max batch size for a single forward pass. The full integration
-        emits steps * (L+1) forwards; we chunk to bound GPU memory.
+        emits (steps - 1) * (L + 2) forwards; we chunk to bound GPU memory.
     """
     global cache
 
@@ -265,86 +308,55 @@ def pace_gradient_classification(
     pred_id = int(logits0.argmax().item())
 
     # ------------------------------------------------------------------
-    # Build the path: g^{(t)} = t/steps * 1, with CLS/SEP gates pinned.
+    # Build the path: g^{(t)} = t/(steps-1) * 1, CLS/SEP gates pinned.
     # ------------------------------------------------------------------
     t_vals = torch.linspace(a, b, steps, device=device, dtype=X.dtype)  # (steps,)
     g_path = t_vals.unsqueeze(1).expand(steps, L).clone()               # (steps, L)
     g_path[:, 0]  = 1.0   # CLS pinned (matches pace_gradients.py)
     g_path[:, -1] = 1.0   # final special token pinned
 
-    # Step size for finite difference. The natural choice is the path
-    # increment itself: h = (b - a) / (steps - 1) ~ 1/m.
+    # Step size for finite difference. Natural choice: h = (b - a) / (steps - 1).
     h = float((b - a) / max(steps - 1, 1))
 
-    # Which token positions get perturbed (skip pinned positions, since
-    # their gate is held at 1 by construction).
-    free_positions = list(range(L))
-    # Token 0 and L-1 are pinned; their u_i contribution will be 0 anyway,
-    # so we keep them in the loop but their probe equals the base point.
+    eye_L = torch.eye(L, device=device, dtype=X.dtype)   # (L, L)
 
     start_time = time.perf_counter()
 
-    # Storage for attributions
-    attr = torch.zeros(L, device=device, dtype=X.dtype)
+    T = steps - 1   # number of active integration steps
+    if T > 0:
+        # (T, L+2, L) -> (T*(L+2), L)
+        gate_block = _build_gate_block(g_path, eye_L, h)
+        gate_flat  = gate_block.reshape(T * (L + 2), L)
 
-    # ------------------------------------------------------------------
-    # Main loop: for each step t, build a batch of L+1 gate vectors:
-    #     row 0       : g^{(t-1)}             (base)
-    #     row 1..L    : g^{(t-1)} + h * e_i    (probes for each token i)
-    # plus one extra row for g^{(t)} (the joint move) so we can compute
-    # the *true* delta_y_hat^{(t)} for exact completeness.
-    # ------------------------------------------------------------------
-    eye_L = torch.eye(L, device=device, dtype=X.dtype)   # (L, L)
-    # We'll also include row L+1 = g^{(t)} (joint advance) so the joint
-    # logit change is measured exactly, not approximated by sum of u_i.
-
-    for t in range(steps):
-        if t == 0:
-            # First step has no predecessor; conventionally delta_y_hat^{(0)} = 0
-            # (matches pace_gradients.py's `delta[0] = 0.0`).
-            continue
-
-        g_prev = g_path[t - 1]   # (L,)
-        g_curr = g_path[t]       # (L,)
-
-        # Build batch of (L + 2) gate vectors:
-        #   0      : base = g_prev
-        #   1..L   : probes g_prev + h * e_i  (clipped to <= 1)
-        #   L+1    : joint  g_curr
-        probes = g_prev.unsqueeze(0) + h * eye_L          # (L, L)
-        probes = probes.clamp(max=1.0)
-        gate_batch = torch.cat(
-            [g_prev.unsqueeze(0), probes, g_curr.unsqueeze(0)],
-            dim=0,
-        )  # (L + 2, L)
-
-        logits_batch = _chunked_forward_logits(
+        logits_flat = _chunked_forward_logits(
             model=model,
             X=X,
             X_baseline=X_RefMask,
-            gate_batch=gate_batch,
+            gate_batch=gate_flat,
             attention_mask=attention_mask,
             extra_kwargs=extra_kwargs,
             chunk_size=chunk_size,
             output_kind="classification",
-        )  # (L+2, num_classes)
+        )                                                  # (T*(L+2), C)
 
-        y_target = logits_batch[:, pred_id]    # (L+2,)
-        y_base   = y_target[0]
-        y_probe  = y_target[1:1 + L]           # (L,)
-        y_joint  = y_target[1 + L]
+        y_target = logits_flat[:, pred_id].reshape(T, L + 2)   # (T, L+2)
+
+        y_base  = y_target[:, 0:1]                             # (T, 1)
+        y_probe = y_target[:, 1:1 + L]                         # (T, L)
+        y_joint = y_target[:, 1 + L]                           # (T,)
 
         # u_i^{(t)} = y_hat(base + h e_i) - y_hat(base)
-        u_t = y_probe - y_base                 # (L,)
+        u = y_probe - y_base                                   # (T, L)
 
-        # alpha_i^{(t)} normalized across tokens (signed; matches paper)
-        denom   = u_t.sum() + 1e-10
-        alpha_t = u_t / denom                  # (L,)
+        # alpha normalized per step (signed; matches paper)
+        alpha = u / (u.sum(dim=1, keepdim=True) + 1e-10)       # (T, L)
 
-        # True joint output change (preserves exact completeness)
-        delta_y_t = y_joint - y_base           # scalar
+        # True joint output change per step (preserves exact completeness)
+        delta_y = (y_joint - y_base.squeeze(1)).unsqueeze(1)   # (T, 1)
 
-        attr = attr + alpha_t * delta_y_t
+        attr = (alpha * delta_y).sum(dim=0)                    # (L,)
+    else:
+        attr = torch.zeros(L, device=device, dtype=X.dtype)
 
     end_time = time.perf_counter()
 
@@ -381,7 +393,7 @@ def pace_gradient_classification(
 
 
 # ---------------------------------------------------------------------------
-# QA attribution (forward-only)
+# QA attribution (forward-only, vectorized)
 # ---------------------------------------------------------------------------
 
 def pace_gradient_qa(
@@ -473,55 +485,45 @@ def pace_gradient_qa(
 
     start_time = time.perf_counter()
 
-    attr_start = torch.zeros(L, device=device, dtype=X.dtype)
-    attr_end   = torch.zeros(L, device=device, dtype=X.dtype)
+    T = steps - 1
+    if T > 0:
+        gate_block = _build_gate_block(g_path, eye_L, h)
+        gate_flat  = gate_block.reshape(T * (L + 2), L)
 
-    for t in range(steps):
-        if t == 0:
-            continue
-
-        g_prev = g_path[t - 1]
-        g_curr = g_path[t]
-
-        probes = g_prev.unsqueeze(0) + h * eye_L
-        probes = probes.clamp(max=1.0)
-        gate_batch = torch.cat(
-            [g_prev.unsqueeze(0), probes, g_curr.unsqueeze(0)],
-            dim=0,
-        )  # (L + 2, L)
-
-        start_logits_b, end_logits_b = _chunked_forward_logits(
+        start_logits_flat, end_logits_flat = _chunked_forward_logits(
             model=model,
             X=X,
             X_baseline=X_baseline,
-            gate_batch=gate_batch,
+            gate_batch=gate_flat,
             attention_mask=attention_mask,
             extra_kwargs=extra_kwargs,
             chunk_size=chunk_size,
             output_kind="qa",
-        )  # each (L+2, L)
+        )                                                  # each (T*(L+2), L)
 
-        # Pull out the target positions (predicted start_idx, end_idx)
-        ys = start_logits_b[:, start_idx]    # (L+2,)
-        ye = end_logits_b[:,   end_idx]      # (L+2,)
+        ys = start_logits_flat[:, start_idx].reshape(T, L + 2)   # (T, L+2)
+        ye = end_logits_flat[:,   end_idx  ].reshape(T, L + 2)   # (T, L+2)
 
-        # Start head
-        ys_base  = ys[0]
-        ys_probe = ys[1:1 + L]
-        ys_joint = ys[1 + L]
+        # --- start head ---
+        ys_base  = ys[:, 0:1]                                # (T, 1)
+        ys_probe = ys[:, 1:1 + L]                            # (T, L)
+        ys_joint = ys[:, 1 + L]                              # (T,)
         u_s      = ys_probe - ys_base
-        alpha_s  = u_s / (u_s.sum() + 1e-10)
-        delta_s  = ys_joint - ys_base
-        attr_start = attr_start + alpha_s * delta_s
+        alpha_s  = u_s / (u_s.sum(dim=1, keepdim=True) + 1e-10)
+        delta_s  = (ys_joint - ys_base.squeeze(1)).unsqueeze(1)
+        attr_start = (alpha_s * delta_s).sum(dim=0)          # (L,)
 
-        # End head
-        ye_base  = ye[0]
-        ye_probe = ye[1:1 + L]
-        ye_joint = ye[1 + L]
+        # --- end head ---
+        ye_base  = ye[:, 0:1]
+        ye_probe = ye[:, 1:1 + L]
+        ye_joint = ye[:, 1 + L]
         u_e      = ye_probe - ye_base
-        alpha_e  = u_e / (u_e.sum() + 1e-10)
-        delta_e  = ye_joint - ye_base
-        attr_end = attr_end + alpha_e * delta_e
+        alpha_e  = u_e / (u_e.sum(dim=1, keepdim=True) + 1e-10)
+        delta_e  = (ye_joint - ye_base.squeeze(1)).unsqueeze(1)
+        attr_end = (alpha_e * delta_e).sum(dim=0)            # (L,)
+    else:
+        attr_start = torch.zeros(L, device=device, dtype=X.dtype)
+        attr_end   = torch.zeros(L, device=device, dtype=X.dtype)
 
     end_time = time.perf_counter()
 
