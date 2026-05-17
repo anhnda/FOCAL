@@ -1,0 +1,4 @@
+transformers==4.56.2
+captum==0.8.0
+datasets==4.1.1
+scikit-learn==1.7.2
