@@ -34,7 +34,7 @@ if __name__ == "__main__":
     parser.add_argument("--model",         type=str, default="distilbert",
                         choices=["distilbert", "bert", "roberta"])
     parser.add_argument("--dataset",       type=str, choices=["sst2", "imdb", "rotten"])
-    parser.add_argument("--n-samples",     type=int, default=1000,
+    parser.add_argument("--n-samples",     type=int, default=100,
                         help="Number of binary masks to draw per input (LIME's N)")
     parser.add_argument("--p-keep",        type=float, default=0.5,
                         help="Bernoulli keep-probability for non-special tokens")
