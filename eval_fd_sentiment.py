@@ -23,7 +23,10 @@ torch.manual_seed(42)
 torch.backends.cuda.enable_flash_sdp(False)
 torch.backends.cuda.enable_mem_efficient_sdp(False)
 torch.backends.cuda.enable_math_sdp(True)
-
+# import os
+# os.environ["HF_HUB_OFFLINE"] = "1"
+# os.environ["TRANSFORMERS_OFFLINE"] = "1"
+# os.environ["HF_DATASETS_OFFLINE"] = "1"
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model",         type=str, default="distilbert",
