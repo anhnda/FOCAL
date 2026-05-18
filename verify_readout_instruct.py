@@ -1,52 +1,44 @@
 """
 Generate-then-analyze interface for the readout-point method.
-INSTRUCT MODEL VERSION — v2.
+INSTRUCT MODEL VERSION — v3.
 
-Changes from v1
----------------
-We dropped two components that were causing the score to misbehave on
-long and extractive answers:
-
-  * D_prefix = full_lp - nopre_lp had two failure modes:
-      - For tokens deep in the answer, nopre_lp asks "how likely is this
-        mid-sentence token to come *immediately* after the question,
-        with no answer-so-far?" That's a nonsensical distribution, so
-        nopre_lp collapses and D_prefix explodes (30+ bits on filler
-        commas in the Jupiter example).
-      - Function words like " of" / " the" have the HIGHEST D_prefix
-        because they're the most predictable from local context, which
-        inverted the score: " of" between "council" and "Mirentane"
-        outranked "1487" (the actual answer) in the Yssaria test.
-
-  * D_input_cum is monotone non-decreasing, so as a multiplier it just
-    inflates late tokens for free.
-
-Replacements
+Story so far
 ------------
-  * SLOT ENTROPY  H_t = H(p(. | question, y_<t))
-        How open was the choice at this position? High = many alternatives
-        were live (the model had a real decision to make); low = forced
-        continuation (BPE tail, punctuation, function-word completion).
-        This is computed during generation at no extra cost.
+v1: Used D_prefix (full_lp - nopre_lp) and a cumulative information term.
+    Both pathologized on long answers: D_prefix exploded because asking
+    "how likely is this mid-sentence token to come straight after the
+    question, no prefix?" is a nonsensical query. The cumulative term
+    inflated late tokens monotonically. Worst case: a comma at position
+    28 of the Jupiter answer scored 400; the actual answer "Jupiter"
+    scored 78.
 
-  * READOUT score:
-        readout = max(Di_inst, 0) * conf * H_slot
-        - max(Di_inst, 0): the question shifted this token up from prior.
-        - conf: the model committed to it.
-        - H_slot: the slot was non-trivial.
-        A pure-filler BPE tail gets conf~1 but H_slot~0, so it scores 0.
-        A function word gets H_slot moderate but Di_inst~0, so it scores 0.
-        The answer-bearing token (e.g. "1487", "Hanoi", "Jupiter") gets
-        all three nonzero.
+v2: Replaced D_prefix with slot entropy H_t = H(p(. | question, y_<t)).
+    Fixed the runaway-commas problem but introduced a new failure mode:
+    slot entropy is measured AT the prediction that produced the token,
+    and by that point the model is already committed. Result: slot_H
+    collapses to ~0.01–0.2 bits on every content token, killing the
+    score. The only positions with substantial slot_H (>1 bit) were
+    structural choice points like " It" and " with" starting a new
+    clause — not content tokens.
 
-  * SETUP score is unchanged in spirit but rewritten to not use D_prefix:
-        setup = max(Di_inst, 0) * H_slot
-        It still flags positions where the question genuinely shifted the
-        distribution AND the slot was open.
+v3 (this file)
+--------------
+Conclusion from v2: Di_inst (information gained from the question, i.e.
+log p(y_t | q, y_<t) - log p(y_t | y_<t)) is the cleanest signal we
+have. It correctly ranked:
+  - "Compact", "Y/ss/aria", "M/ire/nt/ane", "148"/"7" in the Yssaria test
+  - "Treaty", "T" in the Tordesillas test
+  - "largest", "planet" in the Jupiter test
+without flagging filler punctuation or function words.
 
-  * combined = max(setup, readout). For factoid extraction these
-    typically coincide on the answer token; the max just lets either
-    interpretation win.
+So v3 keeps Di_inst as the primary score and adds slot entropy only as
+a *soft* tiebreaker (1 + slot_H), which can't annihilate the signal:
+
+    score = max(Di_inst, 0) * (1 + slot_H)
+
+We also print "Di_inst alone" rankings side-by-side so you can see
+whether the slot-entropy tiebreaker is helping or hurting on each
+example.
 """
 
 import torch
@@ -58,7 +50,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float32
 
 MAX_NEW_TOKENS = 60
-LN2 = float(torch.log(torch.tensor(2.0)))  # for converting nats -> bits
+LN2 = float(torch.log(torch.tensor(2.0)))  # nats -> bits
 
 
 # ---------------------------------------------------------------------------
@@ -87,25 +79,19 @@ def get_stop_token_ids(tokenizer):
 
 
 # ---------------------------------------------------------------------------
-# Greedy generation, recording per-token full log-prob AND slot entropy.
-# Both come from the same forward pass — no extra cost over v1.
+# Greedy generation. Records full log-prob and slot entropy per token
+# from the same forward pass.
 # ---------------------------------------------------------------------------
 
 def _entropy_bits(log_probs_row):
-    """Shannon entropy of a log-probability row, in bits."""
     p = log_probs_row.exp()
-    # Mask zeros to avoid 0 * -inf.
     nz = p > 0
     return -(p[nz] * log_probs_row[nz]).sum().item() / LN2
 
 
 def generate_with_logprobs(model, tokenizer, prompt_ids,
                             stop_token_ids, max_new_tokens=MAX_NEW_TOKENS):
-    """
-    Greedy decode. Returns (answer_ids, full_lp, slot_entropy, answer_text).
-    full_lp: log p(y_t | question, y_<t), in nats.
-    slot_entropy: H(p(. | question, y_<t)), in bits.
-    """
+    """Returns (answer_ids, full_lp_nats, slot_entropy_bits, answer_text)."""
     generated, full_lp_list, slot_H_list = [], [], []
     cur_ids = prompt_ids.clone()
 
@@ -140,8 +126,8 @@ def generate_with_logprobs(model, tokenizer, prompt_ids,
 
 
 # ---------------------------------------------------------------------------
-# Prior pass: log p(y_t | y_<t) starting from BOS, no question, no template.
-# This isolates "what the base LM thought of these tokens on their own".
+# Prior pass: log p(y_t | y_<t) starting from BOS — what the base LM
+# thought of these tokens on their own, no question, no chat template.
 # ---------------------------------------------------------------------------
 
 def prior_logprobs(model, tokenizer, answer_ids):
@@ -162,6 +148,24 @@ def prior_logprobs(model, tokenizer, answer_ids):
 # Analysis
 # ---------------------------------------------------------------------------
 
+def print_topk_summary(label, tokens, score_tensor, k):
+    """Print top-k by a single score tensor."""
+    k = min(k, len(tokens))
+    top_idx = torch.topk(score_tensor, k=k).indices.tolist()
+    print(f"  Top-{k} by {label}:")
+    for i in sorted(top_idx):
+        print(f"    idx {i:>2}  {tokens[i]!r:<14}  "
+              f"score={score_tensor[i].item():.3f}")
+    return set(top_idx)
+
+
+def highlighted(tokens, flagged):
+    return "".join(
+        f"[{tok.strip()}]" if i in flagged else tok
+        for i, tok in enumerate(tokens)
+    )
+
+
 def generate_and_explain(model, tokenizer, user_message, stop_token_ids,
                          top_k=3):
     print("=" * 96)
@@ -170,7 +174,6 @@ def generate_and_explain(model, tokenizer, user_message, stop_token_ids,
 
     prompt_ids, _ = build_chat_prompt(tokenizer, user_message)
 
-    # Pass 1: generation. Records full_lp and slot entropy per token.
     a_ids, full_lp, slot_H, answer_text = generate_with_logprobs(
         model, tokenizer, prompt_ids, stop_token_ids)
     if a_ids.numel() == 0:
@@ -180,33 +183,26 @@ def generate_and_explain(model, tokenizer, user_message, stop_token_ids,
     print(f"  ASSISTANT: {answer_text!r}")
     print()
 
-    # Pass 2: prior log-probs (BOS only, no question).
     pri_lp = prior_logprobs(model, tokenizer, a_ids)
 
-    # Convert to bits for readability.
     full_lp_bits = full_lp / LN2
     pri_lp_bits = pri_lp / LN2
 
-    # Per-token signals.
     Di_inst = full_lp_bits - pri_lp_bits        # bits the question added
-    surprisal = -full_lp_bits                   # raw token surprisal, bits
-    conf = full_lp.exp()                        # p(y_t | question, y_<t)
-    # slot_H already in bits.
+    surprisal = -full_lp_bits                   # raw surprisal, bits
+    conf = full_lp.exp()
+    # slot_H already in bits
 
-    # New scores.
-    # setup:   question shifted the choice AND the slot was open.
-    # readout: the question shifted it, the slot was open, AND the model
-    #          committed (conf high).
+    # v3 scores
     Di_pos = torch.clamp(Di_inst, min=0.0)
-    setup = Di_pos * slot_H
-    readout = Di_pos * slot_H * conf
-    combined = torch.maximum(setup, readout)
+    di_only = Di_pos
+    score = Di_pos * (1.0 + slot_H)             # soft tiebreaker
 
     tokens = [tokenizer.decode([t]) for t in a_ids.tolist()]
 
     header = (f"{'idx':>3}  {'token':<14}  "
               f"{'Di_inst':>8}  {'surpr':>7}  {'slotH':>7}  "
-              f"{'conf':>6}  {'setup':>8}  {'readout':>8}  {'combined':>9}")
+              f"{'conf':>6}  {'di_only':>8}  {'score':>8}")
     print(header)
     print("-" * len(header))
     for i, tok in enumerate(tokens):
@@ -215,30 +211,19 @@ def generate_and_explain(model, tokenizer, user_message, stop_token_ids,
               f"{surprisal[i].item():>7.3f}  "
               f"{slot_H[i].item():>7.3f}  "
               f"{conf[i].item():>6.3f}  "
-              f"{setup[i].item():>8.3f}  "
-              f"{readout[i].item():>8.3f}  "
-              f"{combined[i].item():>9.3f}")
-
-    k = min(top_k, len(tokens))
-    top_idx = torch.topk(combined, k=k).indices.tolist()
-    top_idx_sorted = sorted(top_idx)
-    print()
-    print(f"  Top-{k} important tokens (by combined score):")
-    for i in top_idx_sorted:
-        print(f"    idx {i:>2}  {tokens[i]!r}  "
-              f"(combined={combined[i].item():.2f}, "
-              f"Di_inst={Di_inst[i].item():.2f}b, "
-              f"slotH={slot_H[i].item():.2f}b, "
-              f"conf={conf[i].item():.2f})")
+              f"{di_only[i].item():>8.3f}  "
+              f"{score[i].item():>8.3f}")
 
     print()
-    print("  Highlighted answer:")
-    flagged = set(top_idx)
-    highlighted = "".join(
-        f"[{tok.strip()}]" if i in flagged else tok
-        for i, tok in enumerate(tokens)
-    )
-    print(f"    {highlighted}")
+    flagged_di = print_topk_summary("Di_inst alone", tokens, di_only, top_k)
+    print()
+    flagged_score = print_topk_summary("score = Di_inst * (1 + slotH)",
+                                        tokens, score, top_k)
+    print()
+    print("  Highlighted (Di_inst-alone):")
+    print(f"    {highlighted(tokens, flagged_di)}")
+    print("  Highlighted (score):")
+    print(f"    {highlighted(tokens, flagged_score)}")
     print()
 
 
