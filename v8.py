@@ -1,38 +1,39 @@
 """
-v8 — pure probability distributions. No thresholds, no labels, no classifier.
+v8 — pure distribution dump from permutation sampling. No LOO row, no
+thresholds, no labels.
 
 Hypothesis (two-sided):
   Some input tokens and some output tokens are "core"; the rest is filler.
   Removing a core input changes the output. A core output position has
   a peaked distribution; a filler position is diffuse.
 
-This file just measures and prints. No decisions.
+Sampling: Bernoulli(p) masks with p drawn from {0.25, 0.5, 0.5, 0.75}.
+That's it. Every mask is a random subset. No full, no empty, no LOO.
 
 For every output position t and every mask S we record:
-  log p(y_t | S)              -- prob of the originally-generated token
-  log p(argmax | S)            -- prob of the winning token under S
+  log p(y_t | S)            in nats
   argmax token id under S
-  top-K probs under S          -- shape of the distribution
-  entropy of distribution      -- diffuseness
+  log p(argmax | S)
+  entropy of distribution
+  top-K probs
 
 Then for each position t we print:
-  - The full distribution of log p(y_t | S) across all k masks
+  - Distribution of log p(y_t | S) across all k masks
     (min, p10, p25, median, p75, p90, max, mean, std).
-  - Full-prompt: log p(y_t | full), top-K alternatives with probs, entropy.
-  - Empty-prompt: same.
-  - Each LOO row: which input was removed, log p(y_t | S), whether argmax
-    flipped, and what it flipped to (if anything).
-  - Sorted score for each input token i:
-      delta_i = log p(y_t | full) - log p(y_t | LOO_i)
-    (no threshold, just the number, sorted)
+  - Entropy distribution across masks.
+  - For each input token i, the score
+        score_i = mean_{S: i in S} log p(y_t | S)
+                - mean_{S: i not in S} log p(y_t | S)
+    sorted descending. Also the flip rate among masks where i is dropped.
 
-No filler/core/echo/etc. labels. You decide what the numbers mean.
+No filler/core/echo labels. Just numbers.
 """
 
 import math
 import random
 import torch
 import torch.nn.functional as F
+import numpy as np
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
@@ -44,7 +45,7 @@ LN2 = math.log(2.0)
 
 N_ABLATION_SAMPLES = 128
 RNG_SEED = 0
-TOP_K_ALTS = 8           # how many alternatives to print at full/empty
+TOP_K_ALTS = 8
 
 
 # ---------------------------------------------------------------------------
@@ -125,26 +126,17 @@ def get_stop_token_ids(tokenizer):
 
 
 # ---------------------------------------------------------------------------
-# Forward pass: extract full per-position info under one mask
+# Forward pass under a mask
 # ---------------------------------------------------------------------------
 
 def forward_under_mask(model, prompt_ids, answer_ids, top_k=TOP_K_ALTS):
-    """
-    Run one forward pass. Returns dict of per-position info, all in nats:
-      lp_y      [T]    log p(y_t | S, y_<t)
-      argmax    [T]    argmax token id at each position
-      lp_argmax [T]    its log-prob
-      entropy   [T]    H of distribution at each position
-      topk_ids  [T,K]  top-K token ids
-      topk_lp   [T,K]  their log-probs
-    """
     full_ids = torch.cat([prompt_ids, answer_ids]).unsqueeze(0)
     with torch.no_grad():
         logits = model(full_ids).logits[0]
     L = prompt_ids.numel()
     T = answer_ids.numel()
     pred = torch.arange(L - 1, L - 1 + T, device=DEVICE)
-    log_probs = F.log_softmax(logits[pred], dim=-1)        # [T, V]
+    log_probs = F.log_softmax(logits[pred], dim=-1)
     probs = log_probs.exp()
 
     lp_y = log_probs.gather(1, answer_ids.unsqueeze(1)).squeeze(1)
@@ -187,46 +179,23 @@ def assemble_from_mask(template_prefix_ids, template_suffix_ids,
 
 
 # ---------------------------------------------------------------------------
-# Mask designs
+# Permutation-style masks. NO full / empty / LOO rows.
 # ---------------------------------------------------------------------------
 
-def stratified_masks(n_inputs, k, rng):
-    """
-    Row 0          : full
-    Row 1          : empty
-    Rows 2..2+n-1  : LOO (one input removed)
-    Remaining      : random bernoulli with mixed keep-prob
-    """
+def bernoulli_masks(n_inputs, k, rng):
     masks = []
-    masks.append([1] * n_inputs)
-    masks.append([0] * n_inputs)
-    for i in range(n_inputs):
-        m = [1] * n_inputs
-        m[i] = 0
-        masks.append(m)
-    remaining = max(0, k - len(masks))
-    for _ in range(remaining):
+    for _ in range(k):
         p = rng.choice([0.25, 0.5, 0.5, 0.75])
         masks.append([1 if rng.random() < p else 0 for _ in range(n_inputs)])
-    masks = masks[:k] if len(masks) >= k else masks
     return torch.tensor(masks, dtype=torch.float32, device=DEVICE)
 
 
 # ---------------------------------------------------------------------------
-# Sweep: collect everything across masks
+# Sweep
 # ---------------------------------------------------------------------------
 
 def sweep(model, template_prefix_ids, template_suffix_ids,
           flat_input_ids, answer_ids, masks, top_k=TOP_K_ALTS):
-    """
-    Returns:
-      lp_y       [k, T]   log p(y_t | S)
-      argmax     [k, T]   argmax token id
-      lp_argmax  [k, T]   its log-prob
-      entropy    [k, T]   entropy at each position
-      topk_ids   [k, T, K]
-      topk_lp    [k, T, K]
-    """
     k = masks.shape[0]
     T = answer_ids.numel()
     lp_y = torch.zeros(k, T, device=DEVICE)
@@ -251,7 +220,7 @@ def sweep(model, template_prefix_ids, template_suffix_ids,
 
 
 # ---------------------------------------------------------------------------
-# Reporting — pure dump, no thresholds
+# Reporting
 # ---------------------------------------------------------------------------
 
 def _decode(tokenizer, ids):
@@ -259,9 +228,7 @@ def _decode(tokenizer, ids):
 
 
 def _quantiles(x_bits):
-    """x is a 1-D tensor in bits. Return min/p10/p25/med/p75/p90/max/mean/std."""
     x = x_bits.cpu().double().numpy()
-    import numpy as np
     return {
         "min": float(np.min(x)),
         "p10": float(np.percentile(x, 10)),
@@ -308,26 +275,28 @@ def explain_question(model, tokenizer, parts, stop_token_ids):
     print()
 
     rng = random.Random(RNG_SEED)
-    masks = stratified_masks(n_inputs, N_ABLATION_SAMPLES, rng)
+    masks = bernoulli_masks(n_inputs, N_ABLATION_SAMPLES, rng)
     k = masks.shape[0]
-    print(f"  Running {k} forward passes ...")
+    print(f"  Running {k} forward passes (Bernoulli masks, "
+          f"no LOO/full/empty rows) ...")
     lp_y, argmax, lp_argmax, entropy, topk_ids, topk_lp = sweep(
         model, tpl_pre, tpl_suf, flat_input_ids, a_ids, masks)
     print()
 
-    # Indices into rows of `masks`
-    full_idx = 0
-    empty_idx = 1
-    loo_start = 2
-    loo_end = loo_start + n_inputs
+    # Distribution of mask sizes — sanity check
+    sizes = masks.sum(dim=1).cpu().numpy()
+    print(f"  Mask coalition sizes: min={int(sizes.min())} "
+          f"med={int(np.median(sizes))} max={int(sizes.max())} "
+          f"(n_inputs={n_inputs})")
+    print()
 
-    # Convert to bits for display
     lp_y_b = lp_y / LN2
-    lp_argmax_b = lp_argmax / LN2
     entropy_b = entropy / LN2
-    topk_lp_b = topk_lp / LN2
 
-    # ----- per-output-position dump -----
+    a_ids_cpu = a_ids.cpu()
+    masks_cpu = masks.cpu()
+    argmax_cpu = argmax.cpu()
+
     for t in range(a_ids.numel()):
         print("-" * 100)
         print(f"  OUTPUT POSITION t={t}  token={out_tokens[t]!r}  "
@@ -351,52 +320,46 @@ def explain_question(model, tokenizer, parts, stop_token_ids):
               f"max={eqs['max']:.2f}  mean={eqs['mean']:.2f}")
         print()
 
-        # 3. Full-prompt details: top-K
-        print(f"  Under FULL prompt at t={t}:")
-        print(f"      log p(y_t)    = {lp_y_b[full_idx, t]:+.3f} bits  "
-              f"(prob = {math.exp(lp_y[full_idx, t]):.4f})")
-        print(f"      H             = {entropy_b[full_idx, t]:.3f} bits")
-        print(f"      top-{TOP_K_ALTS} alternatives:")
-        for r in range(TOP_K_ALTS):
-            tid = int(topk_ids[full_idx, t, r].item())
-            mark = "  <-- y_t" if tid == int(a_ids[t].item()) else ""
-            print(f"          {tokenizer.decode([tid])!r:<16}  "
-                  f"lp = {topk_lp_b[full_idx, t, r]:+.3f} b  "
-                  f"p = {math.exp(topk_lp[full_idx, t, r]):.4f}{mark}")
+        # 3. Flip rate overall
+        y_t = int(a_ids_cpu[t].item())
+        flipped_any = (argmax_cpu[:, t] != y_t)
+        print(f"  Argmax-flip rate (over all k masks): "
+              f"{flipped_any.float().mean().item() * 100:.1f}%")
         print()
 
-        # 4. Empty-prompt details
-        print(f"  Under EMPTY prompt at t={t}:")
-        print(f"      log p(y_t)    = {lp_y_b[empty_idx, t]:+.3f} bits  "
-              f"(prob = {math.exp(lp_y[empty_idx, t]):.4f})")
-        print(f"      H             = {entropy_b[empty_idx, t]:.3f} bits")
-        print(f"      argmax        = "
-              f"{tokenizer.decode([int(argmax[empty_idx, t].item())])!r}  "
-              f"lp = {lp_argmax_b[empty_idx, t]:+.3f} b")
-        print()
-
-        # 5. Per-input LOO sweep
-        print(f"  Per-input LOO (sorted by delta = log p(y_t | full) - "
-              f"log p(y_t | LOO_i)):")
-        full_lp_b = lp_y_b[full_idx, t].item()
-        deltas = []
+        # 4. Per-input score:
+        #    score_i = mean log p(y_t | S, i in S) - mean log p(y_t | S, i out)
+        #    Plus: flip rate conditioned on i dropped.
+        print(f"  Per-input score (mean log p(y_t | i in S) - "
+              f"mean log p(y_t | i out)), sorted desc:")
+        col_b = lp_y_b[:, t]
+        rows = []
         for i in range(n_inputs):
-            row = loo_start + i
-            lp_loo = lp_y_b[row, t].item()
-            am_id = int(argmax[row, t].item())
-            am_lp = lp_argmax_b[row, t].item()
-            flipped = am_id != int(a_ids[t].item())
-            deltas.append((i, full_lp_b - lp_loo, lp_loo, am_id, am_lp,
-                           flipped))
-        deltas.sort(key=lambda r: r[1], reverse=True)
-        for i, delta, lp_loo, am_id, am_lp, flipped in deltas:
-            flag = "  FLIPPED" if flipped else ""
-            am_tok = tokenizer.decode([am_id])
-            print(f"      remove [{i:>2}] {group_name_per_input[i]:<10}"
+            inc = masks_cpu[:, i].bool()
+            n_in = int(inc.sum().item())
+            n_out = k - n_in
+            if n_in == 0 or n_out == 0:
+                rows.append((i, float("nan"), float("nan"), float("nan"),
+                             n_in, n_out, float("nan")))
+                continue
+            mean_in = col_b[inc].mean().item()
+            mean_out = col_b[~inc].mean().item()
+            score = mean_in - mean_out
+            flip_out = flipped_any[~inc].float().mean().item()
+            rows.append((i, score, mean_in, mean_out, n_in, n_out, flip_out))
+        rows.sort(key=lambda r: (float("-inf") if math.isnan(r[1]) else r[1]),
+                  reverse=True)
+        for i, score, mean_in, mean_out, n_in, n_out, flip_out in rows:
+            score_s = f"{score:+.3f}" if not math.isnan(score) else "  nan"
+            mi_s = f"{mean_in:+.2f}" if not math.isnan(mean_in) else "  nan"
+            mo_s = f"{mean_out:+.2f}" if not math.isnan(mean_out) else "  nan"
+            flip_s = f"{flip_out * 100:>5.1f}%" if not math.isnan(flip_out) else " nan%"
+            print(f"      [{i:>2}] {group_name_per_input[i]:<10}"
                   f"{in_tokens[i]!r:<14}  "
-                  f"delta = {delta:+.3f} b   "
-                  f"log p(y_t|LOO) = {lp_loo:+.3f} b   "
-                  f"argmax = {am_tok!r} ({am_lp:+.2f} b){flag}")
+                  f"score = {score_s} b   "
+                  f"in:{mi_s}b ({n_in:>3})  "
+                  f"out:{mo_s}b ({n_out:>3})   "
+                  f"flip|out = {flip_s}")
         print()
 
 
